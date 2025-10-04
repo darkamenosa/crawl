@@ -201,7 +201,6 @@ async function createLaunchContext(cliOptions) {
         headless,
         ignoreHTTPSErrors: true,
         args: baseArgs,
-        channel: 'chrome',
     };
 
     if (proxy) {
@@ -297,8 +296,15 @@ async function fetchHtml(url, cliOptions) {
         persistStorage: false,
     }));
 
-    await crawlerInstance.run([{ url }]);
-    await crawlerInstance.teardown();
+    try {
+        await crawlerInstance.run([{ url }]);
+    } finally {
+        // Always tear down crawler resources to avoid dangling browser processes.
+        await crawlerInstance.teardown().catch(() => {});
+        if (crawlerInstance.browserPool?.closeAllBrowsers) {
+            await crawlerInstance.browserPool.closeAllBrowsers(true).catch(() => {});
+        }
+    }
 
     if (cliOptions.useCache && html) {
         await writeToCache(url, html).catch((error) => {
@@ -370,7 +376,7 @@ async function clearCacheDirectory() {
             process.exitCode = 1;
             return;
         }
-        process.stdout.write(html);
+        process.stdout.write(html, () => process.exit(0));
     } catch (error) {
         console.error(error.message || error);
         process.exitCode = 1;
