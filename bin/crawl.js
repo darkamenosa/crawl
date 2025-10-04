@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { PlaywrightCrawler, Configuration, log, LogLevel, sleep } = require('crawlee');
-const { firefox } = require('playwright');
+const { chromium, firefox } = require('playwright');
 const { URL } = require('url');
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
@@ -37,6 +37,7 @@ function parseArguments(args) {
         proxyUrl: process.env.CRAWL_PROXY_URL ?? process.env.CRAWLER_PROXY_URL,
         useCache: true,
         clearCache: false,
+        useCamoufox: false,
     };
 
     let url;
@@ -91,6 +92,11 @@ function parseArguments(args) {
             continue;
         }
 
+        if (arg === '--camoufox') {
+            options.useCamoufox = true;
+            continue;
+        }
+
         console.error(`Error: Unknown option ${arg}`);
         printUsage(console.error);
         process.exit(EXIT_INVALID_ARGUMENT);
@@ -106,13 +112,14 @@ function parseArguments(args) {
 }
 
 function printUsage(logger = console.log) {
-    logger('Usage: crawl <url> [--proxy <url>] [--timeout <seconds>] [--headful] [--no-cache] [--clear-cache]');
+    logger('Usage: crawl <url> [--proxy <url>] [--timeout <seconds>] [--headful] [--no-cache] [--clear-cache] [--camoufox]');
     logger('Options:');
     logger('  --proxy, -p       Override proxy (falls back to CRAWL_PROXY_URL, legacy CRAWLER_PROXY_URL)');
     logger('  --timeout         Navigation timeout in seconds (default 60)');
     logger('  --headful         Launch browser with UI visible');
     logger('  --no-cache        Skip reading/writing the local response cache (.cache directory)');
     logger('  --clear-cache     Remove the local .cache directory before crawling');
+    logger('  --camoufox        Use Firefox with Camoufox hardening instead of the default Chrome setup');
     logger('  --help, -h        Show this help message');
     logger('  --version, -v     Print CLI version');
 }
@@ -140,7 +147,7 @@ function isValidProxyUrl(candidate) {
     }
 }
 
-async function createLaunchOptions(cliOptions) {
+async function createLaunchContext(cliOptions) {
     const headless = cliOptions.headless !== false;
     const baseArgs = [
         '--disable-blink-features=AutomationControlled',
@@ -165,25 +172,46 @@ async function createLaunchOptions(cliOptions) {
         }
     }
 
-    const camoufoxOptions = await camoufoxLaunchOptions({
-        headless,
-        proxy,
-    });
+    if (cliOptions.useCamoufox) {
+        const camoufoxOptions = await camoufoxLaunchOptions({
+            headless,
+            proxy,
+        });
 
-    const mergedArgs = [...new Set([...(camoufoxOptions.args ?? []), ...baseArgs])];
+        const mergedArgs = [...new Set([...(camoufoxOptions.args ?? []), ...baseArgs])];
 
-    const launchOptions = {
-        ...camoufoxOptions,
-        headless,
-        ignoreHTTPSErrors: true,
-        args: mergedArgs,
-    };
+        const launchOptions = {
+            ...camoufoxOptions,
+            headless,
+            ignoreHTTPSErrors: true,
+            args: mergedArgs,
+        };
 
-    if (!launchOptions.proxy && proxy) {
-        launchOptions.proxy = proxy;
+        if (!launchOptions.proxy && proxy) {
+            launchOptions.proxy = proxy;
+        }
+
+        return {
+            launcher: firefox,
+            launchOptions,
+        };
     }
 
-    return launchOptions;
+    const chromeLaunchOptions = {
+        headless,
+        ignoreHTTPSErrors: true,
+        args: baseArgs,
+        channel: 'chrome',
+    };
+
+    if (proxy) {
+        chromeLaunchOptions.proxy = proxy;
+    }
+
+    return {
+        launcher: chromium,
+        launchOptions: chromeLaunchOptions,
+    };
 }
 
 async function fetchHtml(url, cliOptions) {
@@ -194,7 +222,7 @@ async function fetchHtml(url, cliOptions) {
         return cachedHtml;
     }
 
-    const launchOptions = await createLaunchOptions(cliOptions);
+    const launchContext = await createLaunchContext(cliOptions);
 
     const crawlerInstance = new PlaywrightCrawler({
         requestHandlerTimeoutSecs: cliOptions.timeoutSecs ?? 60,
@@ -208,10 +236,7 @@ async function fetchHtml(url, cliOptions) {
                 maxUsageCount: 5,
             },
         },
-        launchContext: {
-            launcher: firefox,
-            launchOptions,
-        },
+        launchContext,
         browserPoolOptions: {
             useFingerprints: false,
         },
