@@ -3,12 +3,17 @@
 const { PlaywrightCrawler, Configuration, log, LogLevel, sleep } = require('crawlee');
 const { firefox } = require('playwright');
 const { URL } = require('url');
+const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
+const path = require('node:path');
+const { createHash } = require('node:crypto');
 const { version: packageVersion, name: packageName } = require('../package.json');
 const { launchOptions: camoufoxLaunchOptions } = require('camoufox-js');
 
 log.setLevel(LogLevel.ERROR);
 
 const EXIT_INVALID_ARGUMENT = 2;
+const CACHE_DIR = path.resolve(__dirname, '..', '.cache');
 
 function handleMetaCommands(args) {
     const [command] = args;
@@ -27,20 +32,28 @@ function handleMetaCommands(args) {
 }
 
 function parseArguments(args) {
-    const url = args[0];
-    if (!isValidUrl(url)) {
-        console.error('Error: First argument must be a valid URL.');
-        printUsage(console.error);
-        process.exit(EXIT_INVALID_ARGUMENT);
-    }
-
     const options = {
         // Prefer the new env var name but keep the legacy one as fallback for backwards compatibility
         proxyUrl: process.env.CRAWL_PROXY_URL ?? process.env.CRAWLER_PROXY_URL,
+        useCache: true,
+        clearCache: false,
     };
 
-    for (let i = 1; i < args.length; i += 1) {
+    let url;
+
+    for (let i = 0; i < args.length; i += 1) {
         const arg = args[i];
+
+        if (!url && !arg.startsWith('-')) {
+            if (!isValidUrl(arg)) {
+                console.error('Error: First non-option argument must be a valid URL.');
+                printUsage(console.error);
+                process.exit(EXIT_INVALID_ARGUMENT);
+            }
+            url = arg;
+            continue;
+        }
+
         if ((arg === '--proxy' || arg === '-p') && args[i + 1]) {
             const proxyCandidate = args[i + 1];
             if (!isValidProxyUrl(proxyCandidate)) {
@@ -49,9 +62,15 @@ function parseArguments(args) {
             }
             options.proxyUrl = proxyCandidate;
             i += 1;
-        } else if (arg === '--headful') {
+            continue;
+        }
+
+        if (arg === '--headful') {
             options.headless = false;
-        } else if (arg === '--timeout' && args[i + 1]) {
+            continue;
+        }
+
+        if (arg === '--timeout' && args[i + 1]) {
             const timeout = Number(args[i + 1]);
             if (Number.isNaN(timeout) || timeout <= 0) {
                 console.error('Error: --timeout must be a positive number of seconds.');
@@ -59,22 +78,41 @@ function parseArguments(args) {
             }
             options.timeoutSecs = timeout;
             i += 1;
-        } else {
-            console.error(`Error: Unknown option ${arg}`);
-            printUsage(console.error);
-            process.exit(EXIT_INVALID_ARGUMENT);
+            continue;
         }
+
+        if (arg === '--no-cache') {
+            options.useCache = false;
+            continue;
+        }
+
+        if (arg === '--clear-cache') {
+            options.clearCache = true;
+            continue;
+        }
+
+        console.error(`Error: Unknown option ${arg}`);
+        printUsage(console.error);
+        process.exit(EXIT_INVALID_ARGUMENT);
+    }
+
+    if (!url) {
+        console.error('Error: URL is required.');
+        printUsage(console.error);
+        process.exit(EXIT_INVALID_ARGUMENT);
     }
 
     return { url, options };
 }
 
 function printUsage(logger = console.log) {
-    logger('Usage: crawl <url> [--proxy <url>] [--timeout <seconds>] [--headful]');
+    logger('Usage: crawl <url> [--proxy <url>] [--timeout <seconds>] [--headful] [--no-cache] [--clear-cache]');
     logger('Options:');
     logger('  --proxy, -p       Override proxy (falls back to CRAWL_PROXY_URL, legacy CRAWLER_PROXY_URL)');
     logger('  --timeout         Navigation timeout in seconds (default 60)');
     logger('  --headful         Launch browser with UI visible');
+    logger('  --no-cache        Skip reading/writing the local response cache (.cache directory)');
+    logger('  --clear-cache     Remove the local .cache directory before crawling');
     logger('  --help, -h        Show this help message');
     logger('  --version, -v     Print CLI version');
 }
@@ -150,6 +188,11 @@ async function createLaunchOptions(cliOptions) {
 
 async function fetchHtml(url, cliOptions) {
     let html = '';
+
+    const cachedHtml = cliOptions.useCache ? await readFromCache(url) : null;
+    if (cachedHtml != null) {
+        return cachedHtml;
+    }
 
     const launchOptions = await createLaunchOptions(cliOptions);
 
@@ -232,7 +275,43 @@ async function fetchHtml(url, cliOptions) {
     await crawlerInstance.run([{ url }]);
     await crawlerInstance.teardown();
 
+    if (cliOptions.useCache && html) {
+        await writeToCache(url, html).catch((error) => {
+            console.error(`Failed to write cache: ${error.message}`);
+        });
+    }
+
     return html;
+}
+
+function getCacheFilePath(url) {
+    const hash = createHash('sha256').update(url).digest('hex');
+    return path.join(CACHE_DIR, `${hash}.html`);
+}
+
+async function readFromCache(url) {
+    try {
+        if (!fsSync.existsSync(CACHE_DIR)) {
+            return null;
+        }
+        const filePath = getCacheFilePath(url);
+        return await fs.readFile(filePath, 'utf8');
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            console.error(`Failed to read cache: ${error.message}`);
+        }
+        return null;
+    }
+}
+
+async function writeToCache(url, content) {
+    await fs.mkdir(CACHE_DIR, { recursive: true });
+    const filePath = getCacheFilePath(url);
+    await fs.writeFile(filePath, content, 'utf8');
+}
+
+async function clearCacheDirectory() {
+    await fs.rm(CACHE_DIR, { recursive: true, force: true });
 }
 
 (async () => {
@@ -249,7 +328,18 @@ async function fetchHtml(url, cliOptions) {
             return;
         }
 
+        if (args.length === 1 && args[0] === '--clear-cache') {
+            await clearCacheDirectory();
+            console.log('Cache cleared.');
+            return;
+        }
+
         const { url, options } = parseArguments(args);
+
+        if (options.clearCache) {
+            await clearCacheDirectory();
+        }
+
         const html = await fetchHtml(url, options);
         if (!html) {
             process.exitCode = 1;
