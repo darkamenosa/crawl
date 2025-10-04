@@ -4,7 +4,6 @@
   "description": "CLI to fetch HTML content with Crawlee",
   "main": "bin/crawl.js",
   "scripts": {
-    "postinstall": "node scripts/camoufox-fetch.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
