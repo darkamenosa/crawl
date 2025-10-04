@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-const { PlaywrightCrawler, log, LogLevel, sleep } = require('crawlee');
-const { BrowserName, DeviceCategory, OperatingSystemsName } = require('@crawlee/browser-pool');
+const { PlaywrightCrawler, Configuration, log, LogLevel, sleep } = require('crawlee');
 const { firefox } = require('playwright');
 const { URL } = require('url');
 const { version: packageVersion, name: packageName } = require('../package.json');
+const { launchOptions: camoufoxLaunchOptions } = require('camoufox-js');
 
 log.setLevel(LogLevel.ERROR);
 
@@ -102,31 +102,47 @@ function isValidProxyUrl(candidate) {
     }
 }
 
-function createLaunchOptions(cliOptions) {
-    const launchOptions = {
-        headless: cliOptions.headless !== false,
-        ignoreHTTPSErrors: true,
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--disable-dev-shm-usage',
-            '--no-sandbox',
-            '--disable-gpu',
-        ],
-    };
+async function createLaunchOptions(cliOptions) {
+    const headless = cliOptions.headless !== false;
+    const baseArgs = [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--disable-gpu',
+    ];
 
+    let proxy;
     if (cliOptions.proxyUrl) {
-        const proxy = new URL(cliOptions.proxyUrl);
-        launchOptions.proxy = {
-            server: `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ''}`,
+        const parsedProxy = new URL(cliOptions.proxyUrl);
+        proxy = {
+            server: `${parsedProxy.protocol}//${parsedProxy.hostname}${parsedProxy.port ? `:${parsedProxy.port}` : ''}`,
         };
 
-        if (proxy.username) {
-            launchOptions.proxy.username = decodeURIComponent(proxy.username);
+        if (parsedProxy.username) {
+            proxy.username = decodeURIComponent(parsedProxy.username);
         }
 
-        if (proxy.password) {
-            launchOptions.proxy.password = decodeURIComponent(proxy.password);
+        if (parsedProxy.password) {
+            proxy.password = decodeURIComponent(parsedProxy.password);
         }
+    }
+
+    const camoufoxOptions = await camoufoxLaunchOptions({
+        headless,
+        proxy,
+    });
+
+    const mergedArgs = [...new Set([...(camoufoxOptions.args ?? []), ...baseArgs])];
+
+    const launchOptions = {
+        ...camoufoxOptions,
+        headless,
+        ignoreHTTPSErrors: true,
+        args: mergedArgs,
+    };
+
+    if (!launchOptions.proxy && proxy) {
+        launchOptions.proxy = proxy;
     }
 
     return launchOptions;
@@ -134,6 +150,8 @@ function createLaunchOptions(cliOptions) {
 
 async function fetchHtml(url, cliOptions) {
     let html = '';
+
+    const launchOptions = await createLaunchOptions(cliOptions);
 
     const crawlerInstance = new PlaywrightCrawler({
         requestHandlerTimeoutSecs: cliOptions.timeoutSecs ?? 60,
@@ -149,23 +167,10 @@ async function fetchHtml(url, cliOptions) {
         },
         launchContext: {
             launcher: firefox,
-            launchOptions: createLaunchOptions(cliOptions),
+            launchOptions,
         },
         browserPoolOptions: {
-            useFingerprints: true,
-            fingerprintOptions: {
-                fingerprintGeneratorOptions: {
-                    browsers: [
-                        {
-                            name: BrowserName.firefox,
-                            minVersion: 120,
-                        },
-                    ],
-                    devices: [DeviceCategory.desktop],
-                    operatingSystems: [OperatingSystemsName.windows],
-                    locales: ['en-US'],
-                },
-            },
+            useFingerprints: false,
         },
         navigationTimeoutSecs: cliOptions.timeoutSecs ?? 60,
         preNavigationHooks: [
@@ -220,7 +225,9 @@ async function fetchHtml(url, cliOptions) {
         failedRequestHandler: async ({ request }) => {
             console.error(`Failed to load ${request.url}`);
         },
-    });
+    }, new Configuration({
+        persistStorage: false,
+    }));
 
     await crawlerInstance.run([{ url }]);
     await crawlerInstance.teardown();
